@@ -229,6 +229,7 @@ class ZipVoiceEngine:
     ):
         self.model_dir = Path(model_dir)
         self.vocoder = Path(vocoder)
+        self.lexicon_extra = Path(lexicon_extra) if lexicon_extra else None
         self.voices_dir = Path(voices_dir)
         self.num_threads = num_threads
         self.default_num_steps = num_steps
@@ -254,9 +255,10 @@ class ZipVoiceEngine:
     def _detect_api(self) -> str:
         """1.13.x 用 GenerationConfig 传参考音频；更老的版本只能用 generate(prompt_text=...)"""
         try:
-            if hasattr(sherpa_onnx.GenerationConfig, "reference_audio"):
+            gc_cls = getattr(sherpa_onnx, "GenerationConfig", None)
+            if gc_cls is not None and hasattr(gc_cls(), "reference_audio"):
                 return "generation_config"
-        except AttributeError:
+        except Exception:  # noqa: BLE001
             pass
         LOG.warning(
             "当前 sherpa-onnx 没有 GenerationConfig.reference_audio，退回旧版 generate(prompt_text=...) 接口。"
