@@ -10,3 +10,6 @@ check.wav
 .probe/
 __pycache__/
 *.pyc
+
+# 项目记忆
+.workbuddy/
