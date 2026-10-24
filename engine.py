@@ -332,7 +332,20 @@ def write_ref_wav(samples: np.ndarray, sr: int, dst: Path) -> None:
     sf.write(str(dst), np.clip(samples, -1.0, 1.0), int(sr), subtype="PCM_16")
 
 
-_CODE_RE = re.compile(r"^[A-Za-z0-9_]{1,32}$")
+def _check_code(code: str) -> str:
+    """代号校验：只挡路径穿透和隐藏文件名，不限制字符种类。
+
+    必须允许连字符（内置音色就叫 leijun-1 / news-female-2）和中文
+    （用户可能自己往 voices/ 丢「张三.wav」），否则这些音色没法改参数、也没法删。
+    """
+    c = (code or "").strip()
+    if not c or len(c) > 64:
+        raise ValueError("代号不能为空，且不超过 64 个字符")
+    if c.startswith("."):
+        raise ValueError("代号不能以点开头")
+    if re.search(r"[/\\\x00-\x1f\x7f]", c):
+        raise ValueError("代号不能包含斜杠或控制字符")
+    return c
 
 
 def make_code(existing: set) -> str:
@@ -825,13 +838,12 @@ def preview(request: Request):
 
 def _voice_paths(code: str) -> Tuple[Path, Path, Path]:
     """校验代号并返回 (wav, txt, json) 三个路径，顺带挡住目录穿越。"""
-    if not _CODE_RE.match(code or ""):
-        raise ValueError("代号只能用英文、数字、下划线，长度 1~32")
+    code = _check_code(code)
     if not ENGINE:
         raise RuntimeError("engine not initialized")
     base = ENGINE.voices.dir.resolve()
     wav = (base / f"{code}.wav").resolve()
-    if wav.parent != base:
+    if wav.parent != base:  # 双保险：解析后必须还在 voices/ 里
         raise ValueError("非法代号")
     return wav, wav.with_suffix(".txt"), wav.with_suffix(".json")
 
