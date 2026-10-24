@@ -28,6 +28,8 @@ EXPECT = {
     "big5-chapters.txt":  ("big5",    "L1", (4, 4), 10),
     "no-marker.txt":      ("utf-8",   "L2", (2, 40), 50),
     "broken-quotes.txt":  ("utf-8",   "L1", (2, 2), 2),
+    "num-chapters.txt":   ("utf-8",   "L1", (6, 6), 20),
+    "large-utf8.txt":     ("utf-8",   "L1", (460, 460), 200),
 }
 
 
@@ -93,6 +95,23 @@ def run() -> int:
         fails += 1
     except Exception:                                  # noqa: BLE001
         print("PASS 随机字节被正确拒绝")
+
+    # 数字编号判定的正负例：靠序列递增性区分"章节号"和"正文里的零散数字"
+    from bookpipe.chapter import _num_sequence_ok
+    cases = [
+        ([1, 2, 3, 4, 5], True, "递增编号"),
+        ([1, 2, 3, 5, 6, 8], True, "缺章跳号"),
+        ([1, 2, 3, 1, 2, 3], True, "分卷重新编号"),
+        ([3, 17, 2, 40, 8, 1], False, "零散数字（正文孤行）"),
+        ([1, 2], False, "数量太少"),
+    ]
+    for nums, want, desc in cases:
+        got = _num_sequence_ok(nums)
+        if got == want:
+            print(f"PASS 数字序列判定 / {desc} -> {got}")
+        else:
+            print(f"FAIL 数字序列判定 / {desc} 期望 {want} 实得 {got}")
+            fails += 1
 
     print(f"\n{'全部通过' if fails == 0 else f'{fails} 项失败'}")
     return 0 if fails == 0 else 1

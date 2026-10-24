@@ -112,6 +112,34 @@ def book_broken_quotes() -> str:
     return "\n".join(parts)
 
 
+def book_num_chapters() -> str:
+    """纯数字编号标题（`001 梦回七九`）——中文网文的第二种主流格式。
+
+    混入带 ？！ 的标题，因为这类标题会被"标题行不含句末标点"的规则误杀。
+    """
+    titles = ["梦回七九", "身世", "谁不会捆绑？", "技术难题", "一百年了！", "回家"]
+    parts = []
+    for i, t in enumerate(titles, start=1):
+        parts.append(chapter(i, f"{i:03d} {t}", paras=10, seed=i))
+    return "\n".join(parts)
+
+
+def book_large_utf8(n_chapters: int = 460) -> tuple[str, bytes]:
+    """大文件：把字节偏移 400000 精确推到某个多字节汉字的中间。
+
+    复现真实 bug——取前 400KB 做样本时若硬切，切点落在汉字中间会导致严格解码失败，
+    正常文件被误判成"解不开"。几千字的测试书永远碰不到，只有真书会。
+    """
+    parts = [chapter(i, f"第{i}章 长夜", paras=12, seed=i) for i in range(1, n_chapters + 1)]
+    text = "\n".join(parts)
+    raw = text.encode("utf-8")
+    for k in range(4):
+        padded = b" " * k + raw
+        if len(padded) > 400_000 and 0x80 <= padded[400_000] <= 0xBF:
+            return text, padded
+    return text, raw
+
+
 def main() -> None:
     OUT.mkdir(exist_ok=True)
     jobs = [
@@ -121,11 +149,19 @@ def main() -> None:
         ("big5-chapters.txt", book_big5(), "big5"),
         ("utf16-chapters.txt", book_utf8_chapters(), "utf-16"),
         ("broken-quotes.txt", book_broken_quotes(), "utf-8"),
+        ("num-chapters.txt", book_num_chapters(), "utf-8"),
     ]
     for name, text, enc in jobs:
         p = OUT / name
         p.write_bytes(text.encode(enc))
         print(f"{name:24} {enc:8} {p.stat().st_size:>8,} 字节  {len(text):>7,} 字")
+
+    # 大文件直接写字节（内部已做过偏移校准）
+    _t, raw = book_large_utf8()
+    p = OUT / "large-utf8.txt"
+    p.write_bytes(raw)
+    print(f"{'large-utf8.txt':24} {'utf-8':8} {p.stat().st_size:>8,} 字节  "
+          f"{len(raw.decode('utf-8')):>7,} 字")
 
 
 if __name__ == "__main__":

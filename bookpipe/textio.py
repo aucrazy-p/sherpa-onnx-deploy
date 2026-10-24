@@ -104,6 +104,39 @@ def _normalize_newlines(text: str) -> str:
     return text.replace("\r\n", "\n").replace("\r", "\n")
 
 
+def _safe_sample(raw: bytes, limit: int) -> bytes:
+    """截取样本，保证切点不落在多字节字符中间。
+
+    踩过的坑：直接 raw[:400_000] 去严格解码，切点若正好落在一个 3 字节汉字的中间，
+    utf-8 就报 UnicodeDecodeError——于是所有候选全部失败，正常文件被误判成"解不开"。
+    小文件永远碰不到这个边界，只有真书才会撞上。
+
+    0x0A 在 utf-8 / gb18030 / big5 里都不可能是多字节序列的组成部分，
+    所以"回退到最后一个换行"对这三种编码都是安全切点。
+    """
+    if len(raw) <= limit:
+        return raw
+    cut = raw.rfind(b"\n", 0, limit)
+    if cut > limit // 2:
+        return raw[: cut + 1]
+    return raw[:limit]
+
+
+def _decode_prefix(data: bytes, enc: str) -> str | None:
+    """解码样本；末尾可能截断多字节字符，逐字节回退最多 3 次再放弃。
+
+    注意这不等于"容错解码"：真正在文件中部出现的坏字节，回退 3 次仍然过不去，
+    会照常返回 None，不会被悄悄放过。
+    """
+    for back in range(4):
+        chunk = data[: len(data) - back] if back else data
+        try:
+            return chunk.decode(enc)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return None
+
+
 def _candidates(sample: bytes) -> list[_Cand]:
     has_bom_utf8 = sample[:3] == b"\xef\xbb\xbf"
     has_bom_utf16 = sample[:2] in (b"\xff\xfe", b"\xfe\xff")
@@ -115,9 +148,8 @@ def _candidates(sample: bytes) -> list[_Cand]:
             enc_use = enc
         if enc == "utf-16" and not has_bom_utf16:
             continue          # 无 BOM 的 "utf-16" 是靠猜的，不参与
-        try:
-            text = sample.decode(enc_use)
-        except (UnicodeDecodeError, LookupError):
+        text = _decode_prefix(sample, enc_use)
+        if text is None:
             continue
         printable, common, score = _analyse(text)
         out.append(_Cand(enc=enc_use, text=text, printable=printable, common=common, score=score))
@@ -129,7 +161,7 @@ def detect_bytes(raw: bytes) -> tuple[str, EncodingInfo]:
     if not raw:
         raise DecodeError("文件是空的")
 
-    sample = raw[:400_000]
+    sample = _safe_sample(raw, 400_000)
     cands = _candidates(sample)
     if not cands:
         raise DecodeError(

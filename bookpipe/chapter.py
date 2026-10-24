@@ -1,11 +1,15 @@
 """切章：三级降级。
 
-L1  章节标题行    第X章 / 卷X 第X章 / Chapter N
+L1  章节标题行    第X章 / 卷X 第X章 / Chapter N / 001 标题（纯数字编号）
 L2  关键词 + 大段空行   序章、楔子、尾声、番外；或 3 连空行形成的自然分隔
 L3  按字数硬切    切点永远落在段落边界，不切断句子
 
 任何一级命中就用那一级，不再往下走。**切不出来不是错误，硬切兜住**——
 一本 200 万字的书卡在第一步，比切得粗一点糟得多。
+
+纯数字编号（如 `001 梦回七九`）是中文网文 txt 的第二种主流格式，
+但单行无法判断——正文里也可能出现"10 分钟过去了"这种行。所以不做单行判定，
+改为**全篇收集后校验数字是否近似递增**，靠序列性质而不是单行文本下结论。
 """
 
 from __future__ import annotations
@@ -32,6 +36,13 @@ _RE_KEY_HEAD = re.compile(
     r"^(?:序章|序言|自序|序|楔子|引子|引言|前言|后记|後記|尾声|尾聲|结语|結語|终章|終章"
     r"|番外|附录|附錄|外传|外傳|大结局|大結局)(?:\s*[:：、.．\-—]?\s*.{0,20})?$"
 )
+# 纯数字编号标题：`001 梦回七九`。单行不可信，靠 _num_sequence_ok 做序列校验。
+_RE_NUM_HEAD = re.compile(r"^([0-9]{1,4})[\s\u3000]+(\S.{0,30})$")
+
+# 数字编号序列的最大值，超过这个数基本不是章节号
+_NUM_MAX = 3000
+# 递增相邻对的最低比例：允许少量缺章、跳章、卷内重新编号
+_NUM_MONOTONIC_RATIO = 0.85
 
 # 标题行里不该出现的句子结束符
 _SENT_END = "。！？!?"
@@ -71,6 +82,10 @@ def _classify(line: str) -> str | None:
     s = _clean(line)
     if not s or len(s) > _MAX_TITLE_LEN:
         return None
+    # 数字编号标题允许带句末标点（"717 一百年了！"、"536 谁不会捆绑？"）。
+    # 单行误判由 _num_sequence_ok 的递增校验兜住，不靠标点判断。
+    if _RE_NUM_HEAD.match(s):
+        return "num"
     if any(ch in s for ch in _SENT_END):
         return None
     if _RE_CH_HEAD.match(s):
@@ -82,6 +97,25 @@ def _classify(line: str) -> str | None:
     if _RE_KEY_HEAD.match(s):
         return "key"
     return None
+
+
+def _num_sequence_ok(title_nums: list[int]) -> bool:
+    """判断一批数字标题是否构成"章节编号"序列。
+
+    正文里的孤行数字（"10 分钟过去了"）是零散的、不递增的；
+    真正的章节编号则近似严格递增。用这个性质做判定，比逐行猜文本可靠得多。
+
+    宽容两种情况：缺章跳号（014 缺失）、分卷后重新从 1 编号。
+    """
+    if len(title_nums) < 3:
+        return False
+    if max(title_nums) > _NUM_MAX:
+        return False
+    pairs = list(zip(title_nums, title_nums[1:]))
+    if not pairs:
+        return False
+    ok = sum(1 for a, b in pairs if b > a or (b <= 2 and a >= 3))
+    return ok / len(pairs) >= _NUM_MONOTONIC_RATIO
 
 
 def _headings(text: str) -> list[tuple[int, str, str]]:
@@ -202,7 +236,25 @@ def split_chapters(
     warnings: list[str] = []
 
     # ---- L1：章节标题行
-    heads = [(off, title) for off, title, kind in _headings(text) if kind in ("ch", "vol", "en")]
+    all_heads = _headings(text)
+    heads = [(off, title) for off, title, kind in all_heads if kind in ("ch", "vol", "en")]
+
+    num_heads = []
+    for off, title, kind in all_heads:
+        if kind != "num":
+            continue
+        m = _RE_NUM_HEAD.match(title)
+        if m:
+            num_heads.append((off, title, int(m.group(1))))
+    if len(num_heads) >= min_chapters:
+        if _num_sequence_ok([n for _, _, n in num_heads]):
+            heads = sorted(heads + [(off, t) for off, t, _ in num_heads], key=lambda x: x[0])
+        else:
+            warnings.append(
+                f"发现 {len(num_heads)} 处纯数字开头的短行，但编号不近似递增，"
+                f"判定为正文内容而非章节标题，已忽略"
+            )
+
     if len(heads) >= min_chapters:
         chapters = _build(text, heads, "L1")
         return SplitResult(chapters, "L1", warnings)
