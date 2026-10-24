@@ -299,22 +299,53 @@ class ZipVoiceEngine:
                 self.vocoder.name,
             )
 
-        lexicons = []
+        # ZipVoice:词典和 espeak 数据都在模型包里,用自带的就够。
+        # 千万别塞外部的 en-us 音素词典(如 kokoro 的 lexicon-en-us.txt):它的 token 集和本模型的
+        # tokens.txt 完全对不上,加载时会逐条刷 "Unknown token"(几万行),还会污染英文分词。
+        lexicons: List[str] = []
         main_lex = self._pick("lexicon.txt")
         if main_lex:
             lexicons.append(str(main_lex))
         if self.lexicon_extra and Path(self.lexicon_extra).is_file():
-            lexicons.append(str(Path(self.lexicon_extra)))
+            extra = Path(self.lexicon_extra)
+            if not main_lex or extra.resolve() != main_lex.resolve():
+                LOG.warning(
+                    "--lexicon 指定了额外词典 %s。只有当它和 %s 的 token 集一致时才有用,"
+                    "否则会刷满 Unknown token;不确定就别传这个参数。",
+                    extra.name, tokens.name,
+                )
+            lexicons.append(str(extra))
+
+        # espeak-ng-data 负责英文词的音素化兜底,缺了英文会退化成逐字母读或直接跳过
+        data_dir = self.model_dir / "espeak-ng-data"
+        if data_dir.is_dir():
+            LOG.info("espeak-ng-data: %s", data_dir)
+        else:
+            LOG.warning(
+                "缺 %s —— 英文单词没有音素化兜底(中文不受影响)。该目录在模型的 tar 包里,"
+                "检查解压是否完整;重跑 install.sh 会重新下载。",
+                data_dir,
+            )
+
+        zv_kwargs = {
+            "tokens": str(tokens),
+            "encoder": str(encoder),
+            "decoder": str(decoder),
+            "vocoder": str(self.vocoder),
+            "lexicon": ",".join(lexicons),
+        }
+        if data_dir.is_dir():
+            zv_kwargs["data_dir"] = str(data_dir)
+        try:
+            zv_cfg = sherpa_onnx.OfflineTtsZipvoiceModelConfig(**zv_kwargs)
+        except TypeError:
+            zv_kwargs.pop("data_dir", None)
+            LOG.warning("当前 sherpa-onnx 的 ZipVoice 配置不支持 data_dir,建议升级到 >= 1.13.8")
+            zv_cfg = sherpa_onnx.OfflineTtsZipvoiceModelConfig(**zv_kwargs)
 
         cfg = sherpa_onnx.OfflineTtsConfig(
             model=sherpa_onnx.OfflineTtsModelConfig(
-                zipvoice=sherpa_onnx.OfflineTtsZipvoiceModelConfig(
-                    tokens=str(tokens),
-                    encoder=str(encoder),
-                    decoder=str(decoder),
-                    vocoder=str(self.vocoder),
-                    lexicon=",".join(lexicons),
-                ),
+                zipvoice=zv_cfg,
                 num_threads=self.num_threads,
                 debug=False,
                 provider="cpu",
@@ -599,7 +630,7 @@ def main() -> int:
     p = argparse.ArgumentParser(description="ZipVoice + sherpa-onnx TTS 服务", formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     p.add_argument("--model-dir", default=str(here / "models" / "sherpa-onnx-zipvoice-distill-int8-zh-en-emilia"))
     p.add_argument("--vocoder", default=str(here / "models" / "vocos_24khz.onnx"))
-    p.add_argument("--lexicon", default=str(here / "models" / "lexicon-en-us.txt"), help="英文字典，可缺省")
+    p.add_argument("--lexicon", default="", help="额外词典，一般留空（ZipVoice 用模型包自带的 lexicon.txt）")
     p.add_argument("--voices-dir", default=str(here / "voices"))
     p.add_argument("--cache-dir", default=str(here / "cache"), help="wav 缓存目录，空字符串=关闭")
     p.add_argument("--host", default="0.0.0.0")

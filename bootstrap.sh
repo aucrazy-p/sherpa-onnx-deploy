@@ -127,7 +127,6 @@ nohup "$VENV_PY" "$APP_DIR/engine.py" \
   --port "$PORT" \
   --model-dir "$APP_DIR/models/$MODEL_NAME" \
   --vocoder "$APP_DIR/models/$VOCOS_NAME" \
-  --lexicon "$APP_DIR/models/lexicon-en-us.txt" \
   --voices-dir "$APP_DIR/voices" \
   --cache-dir "$APP_DIR/cache" \
   > "$APP_DIR/logs/engine.log" 2>&1 &

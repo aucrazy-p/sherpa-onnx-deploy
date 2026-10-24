@@ -27,7 +27,6 @@ VOCOS_NAME="vocos_24khz.onnx"
 GH_BASE="https://github.com/k2-fsa/sherpa-onnx/releases/download"
 GH_MODEL_TAR="$GH_BASE/tts-models/$MODEL_NAME.tar.bz2"
 GH_VOCOS="$GH_BASE/vocoder-models/$VOCOS_NAME"        # 注意是 vocoder-models，不是 tts-models
-GH_LEXICON_EN="$GH_BASE/tts-models/lexicon-en-us.txt"
 
 # ModelScope 镜像（国内直连，无需代理）
 MS_BASE="https://modelscope.cn/models"
@@ -307,8 +306,9 @@ if [ "$SKIP_MODELS" = "0" ]; then
       rm -f "$MODEL_NAME.tar.bz2"
     fi
     fetch "$GH_VOCOS" "$VOCOS_NAME" size || die "vocoder 下载失败（缺它就合成不出来）"
-    # 英文字典可选：6MB，缺失只影响英文发音
-    fetch "$GH_LEXICON_EN" "lexicon-en-us.txt" none || warn "lexicon-en-us.txt 没下成功，中文不受影响"
+    # 注意：不要再下 lexicon-en-us.txt。那是 kokoro 的 en-us 音素词典，token 集和 ZipVoice 的
+    # tokens.txt 对不上，塞进去只会让 sherpa-onnx 在加载时刷几万行 "Unknown token"。
+    # ZipVoice 用模型包里自带的 lexicon.txt + espeak-ng-data，解压后就在 $MODEL_NAME/ 下。
   else
     mkdir -p "$MODEL_NAME/test_wavs"
     for f in encoder.int8.onnx decoder.int8.onnx tokens.txt lexicon.txt \
@@ -317,7 +317,6 @@ if [ "$SKIP_MODELS" = "0" ]; then
       fetch "$MS_MODEL/$f" "$MODEL_NAME/$f" none || die "下载失败: $f（可换源：bash install.sh --source github）"
     done
     fetch "$MS_VOCOS" "$VOCOS_NAME" size || die "vocoder 下载失败（缺它就合成不出来）"
-    [ -s "lexicon-en-us.txt" ] || warn "ModelScope 源没有 lexicon-en-us.txt，英文发音会受影响（可另从 GitHub 补）"
   fi
 
   step "校验模型文件"
@@ -330,6 +329,16 @@ if [ "$SKIP_MODELS" = "0" ]; then
       warn "缺失 $f"; MISSING=1
     fi
   done
+  # 词典 + espeak 数据：英文要靠它们音素化，缺了英文会读成逐字母或直接跳过（中文不受影响）
+  for f in "$MODEL_DIR/lexicon.txt"; do
+    [ -s "$f" ] && log "OK  $(du -h "$f" | cut -f1)  ${f#"$MODELS"/}" \
+      || warn "缺 lexicon.txt（模型包里自带，检查解压是否完整）"
+  done
+  if [ -d "$MODEL_DIR/espeak-ng-data" ]; then
+    log "OK  espeak-ng-data/ （$(ls "$MODEL_DIR/espeak-ng-data" | wc -l) 项）"
+  else
+    warn "缺 espeak-ng-data/：英文没有音素化兜底，会退化成逐字母读。用 github 源重装可补齐"
+  fi
   [ "$MISSING" = "0" ] || die "模型文件不全，重跑 install.sh（已下载的会跳过）"
 else
   warn "已跳过模型下载（--skip-models）"
@@ -374,7 +383,6 @@ step "自检（真正加载模型，能暴露 vocoder 不匹配等问题）"
 python "$APP_DIR/engine.py" --check \
   --model-dir "$MODELS/$MODEL_NAME" \
   --vocoder "$MODELS/$VOCOS_NAME" \
-  --lexicon "$MODELS/lexicon-en-us.txt" \
   --voices-dir "$VOICES"
 
 # ---------------------------------------------------------------- 收尾
