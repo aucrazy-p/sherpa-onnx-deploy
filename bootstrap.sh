@@ -69,7 +69,22 @@ if [ -z "$PYTHON_BIN" ]; then
     command -v "$c" >/dev/null 2>&1 && { PYTHON_BIN="$c"; break; }
   done
 fi
-[ -n "$PYTHON_BIN" ] || die "找不到 python3.10~3.12。sherpa-onnx 没有 3.13 的 wheel，请先装 python3.12"
+
+# 系统只有 3.13/3.14 时自动补一个 3.12（sherpa-onnx 没有 3.13 的 wheel）
+if [ -z "$PYTHON_BIN" ] && command -v apt-get >/dev/null 2>&1; then
+  if [ "$(id -u)" = "0" ] || { command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; }; then
+    warn "没找到 python3.10~3.12，尝试自动安装 python3.12（约 30MB）"
+    APT=(apt-get)
+    [ "$(id -u)" != "0" ] && APT=(sudo -n apt-get)
+    "${APT[@]}" update -qq || warn "apt-get update 未成功，用已有索引继续"
+    "${APT[@]}" install -y -qq --no-install-recommends python3.12 python3.12-venv \
+      || warn "自动安装 python3.12 失败"
+    for c in python3.12 python3.11 python3.10; do
+      command -v "$c" >/dev/null 2>&1 && { PYTHON_BIN="$c"; break; }
+    done
+  fi
+fi
+[ -n "$PYTHON_BIN" ] || die "找不到 python3.10~3.12。sherpa-onnx 没有 3.13 的 wheel，请先装：apt install -y python3.12 python3.12-venv"
 PYVER="$("$PYTHON_BIN" -c 'import sys;print("%d.%d"%sys.version_info[:2])')"
 case "$PYVER" in
   3.10|3.11|3.12) log "Python $PYVER ($PYTHON_BIN)" ;;
@@ -88,14 +103,18 @@ fi
 
 # ---------------------------------------------------------------- 1. 安装
 step "安装（venv + 依赖 + 模型 + 音色库）"
-if [ -x "$APP_DIR/venv/bin/python" ] && [ "$FORCE_INSTALL" = "0" ]; then
-  log "已安装过，跳过。要重装加 --reinstall"
+VENV_PY="$APP_DIR/venv/bin/python"
+# 注意：不能只看 venv/bin/python 存在就跳过。上次中断会留下"有解释器没有 pip"的半成品，
+# 跳过安装后会在后面莫名其妙地失败（No module named pip）。必须验证 pip 真的可用。
+if [ -x "$VENV_PY" ] && "$VENV_PY" -m pip --version >/dev/null 2>&1 && [ "$FORCE_INSTALL" = "0" ]; then
+  log "已安装过且 venv 可用，跳过。要重装加 --reinstall"
 else
+  [ -e "$APP_DIR/venv" ] && warn "venv 存在但不可用，将重建"
   bash install.sh --dir "$APP_DIR" --python "$PYTHON_BIN"
 fi
 
-VENV_PY="$APP_DIR/venv/bin/python"
 [ -x "$VENV_PY" ] || die "$VENV_PY 不存在，安装没成功"
+"$VENV_PY" -m pip --version >/dev/null 2>&1 || die "venv 里没有可用的 pip，删掉 $APP_DIR/venv 后重跑"
 
 # ---------------------------------------------------------------- 2. 起服务
 step "启动 TTS 服务（端口 $PORT）"

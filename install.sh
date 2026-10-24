@@ -11,6 +11,10 @@
 #   bash install.sh --source modelscope # 模型走 ModelScope（国内网络更快）
 #   bash install.sh --skip-models       # 只装 Python 环境
 #   bash install.sh --index-url https://pypi.tuna.tsinghua.edu.cn/simple
+#   bash install.sh --no-auto-deps      # 缺系统包时不自动 apt install，直接报错退出
+#
+# 会自动补装的系统包（缺了才装，有 root 或免密 sudo 时）：
+#   python3.X-venv（ensurepip）、curl、bzip2、ca-certificates、tar
 #
 set -euo pipefail
 
@@ -39,6 +43,7 @@ PYTHON_BIN="${PYTHON_BIN:-python3}"
 SOURCE="github"
 SKIP_MODELS=0
 INDEX_URL="${PIP_INDEX_URL:-}"
+AUTO_DEPS="${AUTO_DEPS:-1}"
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -47,7 +52,8 @@ while [ $# -gt 0 ]; do
     --source)      SOURCE="$2"; shift 2 ;;
     --index-url)   INDEX_URL="$2"; shift 2 ;;
     --skip-models) SKIP_MODELS=1; shift ;;
-    -h|--help)     sed -n '2,20p' "$0"; exit 0 ;;
+    --no-auto-deps) AUTO_DEPS=0; shift ;;
+    -h|--help)     sed -n '2,18p' "$0"; exit 0 ;;
     *) echo "未知参数: $1（-h 查看用法）" >&2; exit 2 ;;
   esac
 done
@@ -88,9 +94,117 @@ if (maj, minr) == (3, 13):
     print("[warn] Python 3.13 的 sherpa-onnx wheel 不一定齐全，装不上就换 3.12", file=sys.stderr)
 PY
 
-command -v curl >/dev/null 2>&1 || die "缺少 curl，请先 apt install -y curl"
-if [ "$SKIP_MODELS" = "0" ] && ! command -v bzip2 >/dev/null 2>&1; then
-  die "缺少 bzip2（解 tar.bz2 需要），请先 apt install -y bzip2"
+# ---------------------------------------------------------------- 系统依赖
+# 目标：用户在干净系统上只需要 bash install.sh 一条命令，不手动 apt install。
+step "系统依赖"
+
+PM=""
+for c in apt-get dnf yum apk; do
+  if command -v "$c" >/dev/null 2>&1; then
+    case "$c" in apt-get) PM=apt ;; *) PM="${c}" ;; esac
+    break
+  fi
+done
+log "包管理器: ${PM:-未识别}   身份: $( [ "$(id -u)" = 0 ] && echo root || echo "uid=$(id -u)" )"
+
+run_root() {
+  if [ "$(id -u)" = "0" ]; then
+    "$@"
+  elif command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+    sudo -n "$@"
+  else
+    return 127
+  fi
+}
+
+# apt 有 dpkg 锁时需要重试（云镜像首次开机常有 unattended-upgrade 在跑）
+pkg_install() {
+  [ $# -gt 0 ] || return 0
+  local tries=0 rc=0
+  while [ "$tries" -lt 3 ]; do
+    tries=$((tries + 1))
+    rc=0
+    case "$PM" in
+      apt)
+        # NEEDRESTART_MODE=a：Ubuntu 22.04+ 装了 needrestart 后 apt 会弹交互，非交互环境会卡住
+        run_root env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a \
+          apt-get update -qq || warn "apt-get update 未成功，尝试用已有索引继续"
+        run_root env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a \
+          apt-get install -y -qq --no-install-recommends "$@" || rc=$?
+        ;;
+      dnf) run_root dnf install -y -q "$@" || rc=$? ;;
+      yum) run_root yum install -y -q "$@" || rc=$? ;;
+      apk) run_root apk add --no-cache "$@" || rc=$? ;;
+      *)   rc=127 ;;
+    esac
+    [ "$rc" = 0 ] && return 0
+    [ "$rc" = 127 ] && return 127
+    [ "$tries" -lt 3 ] && { warn "安装失败（第 $tries 次），3 秒后重试：$*"; sleep 3; }
+  done
+  return "$rc"
+}
+
+DEPS=()
+NEED_VENV=0
+if ! "$PYTHON_BIN" -c 'import ensurepip' >/dev/null 2>&1; then
+  NEED_VENV=1
+  case "$PM" in
+    apt) DEPS+=("python${PY_VER}-venv") ;;
+    *)   DEPS+=(python3-venv) ;;
+  esac
+fi
+command -v curl >/dev/null 2>&1 || DEPS+=(curl)
+command -v tar  >/dev/null 2>&1 || DEPS+=(tar)
+if [ "$SKIP_MODELS" = "0" ]; then
+  command -v bzip2 >/dev/null 2>&1 || DEPS+=(bzip2)     # 解 tar.bz2 必需
+fi
+case "$PM" in
+  apt) [ -s /etc/ssl/certs/ca-certificates.crt ] || DEPS+=(ca-certificates) ;;
+  apk) [ -s /etc/ssl/certs/ca-certificates.crt ] || DEPS+=(ca-certificates) ;;
+esac
+
+if [ ${#DEPS[@]} -eq 0 ]; then
+  log "系统依赖齐全，无需安装"
+else
+  log "缺失: ${DEPS[*]}"
+  if [ "$AUTO_DEPS" != "1" ]; then
+    die "缺少系统包 ${DEPS[*]}；去掉 --no-auto-deps 让脚本自动安装，或手动装"
+  fi
+  if [ -z "$PM" ]; then
+    die "无法识别包管理器（apt/dnf/yum/apk 都没有），请手动安装: ${DEPS[*]}"
+  fi
+
+  # 权限问题先判，否则会被后面"换包名重试"的失败信息掩盖成"包装不上"
+  if [ "$(id -u)" != "0" ]; then
+    if ! command -v sudo >/dev/null 2>&1; then
+      die "当前非 root 且没有 sudo，无法自动装包。请用 root 运行，或手动安装: ${DEPS[*]}"
+    elif ! sudo -n true 2>/dev/null; then
+      die "sudo 需要输入密码（脚本非交互）。请用 root 运行，或先手动执行 sudo -v 再重跑。缺失: ${DEPS[*]}"
+    fi
+  fi
+
+  if ! pkg_install "${DEPS[@]}"; then
+    # apt 上 python3.X-venv 有时没有对应版本（如自编译 Python），退回通用名再试一次
+    HAS_PY=0
+    for d in "${DEPS[@]}"; do case "$d" in python*-venv) HAS_PY=1 ;; esac; done
+    if [ "$PM" = "apt" ] && [ "$HAS_PY" = "1" ]; then
+      DEPS2=()
+      for d in "${DEPS[@]}"; do
+        case "$d" in python*-venv) DEPS2+=(python3-venv python3-pip) ;; *) DEPS2+=("$d") ;; esac
+      done
+      warn "python${PY_VER}-venv 装不上，改用通用包名重试：${DEPS2[*]}"
+      pkg_install "${DEPS2[@]}" || die "系统依赖安装失败。请手动执行：apt-get install -y ${DEPS2[*]}"
+    else
+      die "系统依赖安装失败，请手动执行后重跑。缺失: ${DEPS[*]}"
+    fi
+  fi
+
+  # 装完必须真的可用，否则早失败好过晚失败
+  if [ "$NEED_VENV" = "1" ] && ! "$PYTHON_BIN" -c 'import ensurepip' >/dev/null 2>&1; then
+    die "已安装 venv 相关包，但 $PYTHON_BIN 仍无法使用 ensurepip；请确认包名与 Python 版本匹配（当前 $PY_FULL）"
+  fi
+  command -v curl >/dev/null 2>&1 || die "curl 仍未安装成功"
+  log "系统依赖已就绪"
 fi
 
 FREE_MB="$(df -Pm "$(dirname "$APP_DIR")" 2>/dev/null | awk 'NR==2{print $4}')"
@@ -109,9 +223,19 @@ log "安装目录: $APP_DIR"
 # ---------------------------------------------------------------- Python 环境
 step "创建 venv 并安装依赖"
 
-if [ ! -x "$VENV/bin/python" ]; then
-  "$PYTHON_BIN" -m venv "$VENV" || die "venv 创建失败；Debian/Ubuntu 需要 apt install -y python3-venv"
+# 上一次失败可能留下半成品 venv（有 bin/python 但没有 pip），必须先识别再重建，
+# 否则 `[ ! -x $VENV/bin/python ]` 会判定"已存在"而跳过，后面 pip 直接报 No module named pip。
+if [ -d "$VENV" ] && [ "$VENV" != "$APP_DIR" ] && [ "$(basename "$VENV")" = "venv" ] \
+   && [ -x "$VENV/bin/python" ] && ! "$VENV/bin/python" -m pip --version >/dev/null 2>&1; then
+  warn "发现上次中断留下的不完整 venv（pip 不可用），删除重建"
+  rm -rf "$VENV"
 fi
+
+if [ ! -x "$VENV/bin/python" ]; then
+  "$PYTHON_BIN" -m venv "$VENV" || die "venv 创建失败（请确认已安装 python${PY_VER}-venv）"
+fi
+"$VENV/bin/python" -m pip --version >/dev/null 2>&1 \
+  || die "venv 里没有可用的 pip（$VENV）。删掉 $VENV 后重跑本脚本即可"
 # shellcheck disable=SC1091
 . "$VENV/bin/activate"
 
