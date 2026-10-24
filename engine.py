@@ -21,10 +21,13 @@ Legado 里填：http://<服务器>:8080/tts?text={{speakText}}&voice=news-female
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import io
+import json
 import logging
 import re
+import secrets
 import sys
 import threading
 import time
@@ -37,7 +40,7 @@ import soundfile as sf
 
 import sherpa_onnx
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response
 import uvicorn
 
 LOG = logging.getLogger("tts")
@@ -112,16 +115,26 @@ def to_wav_bytes(samples: np.ndarray, sample_rate: int) -> bytes:
 # --------------------------------------------------------------------------- 音色库
 @dataclass
 class Voice:
-    name: str
+    name: str          # 内部标识 = 文件名 stem = API 里的 voice / code
     wav: Path
     text: str
     duration: float = 0.0
     sample_rate: int = 0
     mtime_ns: int = 0
+    display: str = ""      # 展示名（中文名），来自旁挂 .json；没有就用 stem
+    num_steps: int = 0     # 该音色的默认精度，0 = 用服务全局默认
+    speed: float = 0.0     # 该音色的默认语速，0 = 用服务全局默认
+    created: float = 0.0   # 创建时间戳，仅用于列表排序
+    has_meta: bool = False
 
 
 class VoiceRegistry:
-    """扫 voices/*.wav + 同名 .txt，目录一变就重载（热加载）。"""
+    """扫 voices/*.wav + 同名 .txt + 可选同名 .json，目录一变就重载（热加载）。
+
+    .json 旁挂配置（可选）：
+        {"name": "步非烟", "num_steps": 4, "speed": 1.0, "created": 1761...}
+    没有 .json 的老音色照样能用，展示名回退成文件名。
+    """
 
     def __init__(self, directory: Path):
         self.dir = Path(directory)
@@ -139,7 +152,12 @@ class VoiceRegistry:
                 st = p.stat()
             except FileNotFoundError:
                 continue
-            items.append((p.name, st.st_mtime_ns, st.st_size))
+            # 把同名 .json 的 mtime 也算进签名，改展示名/精度能触发重载
+            try:
+                jm = p.with_suffix(".json").stat().st_mtime_ns
+            except FileNotFoundError:
+                jm = 0
+            items.append((p.name, st.st_mtime_ns, st.st_size, jm))
         return tuple(items)
 
     def rescan(self, force: bool = False) -> bool:
@@ -147,7 +165,7 @@ class VoiceRegistry:
         if not force and sig == self._sig:
             return False
         voices: Dict[str, Voice] = {}
-        for name, mtime_ns, _size in sig:
+        for name, mtime_ns, _size, _jm in sig:
             wav = self.dir / name
             txt = wav.with_suffix(".txt")
             if not txt.is_file():
@@ -157,7 +175,25 @@ class VoiceRegistry:
             if not ref_text:
                 LOG.warning("音色 %s 的转写文件是空的，跳过", name)
                 continue
-            voices[wav.stem] = Voice(name=wav.stem, wav=wav, text=ref_text, mtime_ns=mtime_ns)
+            meta: dict = {}
+            mpath = wav.with_suffix(".json")
+            if mpath.is_file():
+                try:
+                    meta = json.loads(mpath.read_text(encoding="utf-8")) or {}
+                except Exception as e:
+                    LOG.warning("音色 %s 的 %s 解析失败(%s)，按无配置处理", name, mpath.name, e)
+                    meta = {}
+            voices[wav.stem] = Voice(
+                name=wav.stem,
+                wav=wav,
+                text=ref_text,
+                mtime_ns=mtime_ns,
+                display=str(meta.get("name") or wav.stem),
+                num_steps=int(meta.get("num_steps") or 0),
+                speed=float(meta.get("speed") or 0.0),
+                created=float(meta.get("created") or 0.0),
+                has_meta=bool(meta),
+            )
         self._voices = voices
         self._audio.clear()
         self._sig = sig
@@ -194,6 +230,118 @@ class VoiceRegistry:
             LOG.warning("音色 %s 参考音频 %.1f 秒，偏长（官方建议 3~10 秒，过长又慢又糊）", name, v.duration)
         self._audio[name] = (v.mtime_ns, samples, sr)
         return samples, sr
+
+
+# --------------------------------------------------------------------------- 参考音频预处理
+def to_mono(samples: np.ndarray) -> np.ndarray:
+    """多声道混成单声道，返回 float32 连续数组。"""
+    a = np.asarray(samples, dtype=np.float32)
+    if a.ndim == 2:
+        a = a.mean(axis=1)
+    return np.ascontiguousarray(a, dtype=np.float32)
+
+
+def trim_silence(samples: np.ndarray, sr: int, thresh_db: float = -42.0, pad: float = 0.06) -> np.ndarray:
+    """按包络阈值裁掉首尾静音，两端各留 pad 秒，避免切掉气口。"""
+    if samples.size == 0:
+        return samples
+    env = np.abs(samples)
+    peak = float(env.max())
+    if peak <= 0:
+        return samples
+    thr = max(peak * float(10.0 ** (thresh_db / 20.0)), 1e-5)
+    idx = np.where(env > thr)[0]
+    if idx.size == 0:
+        return samples
+    p = int(pad * sr)
+    return samples[max(0, int(idx[0]) - p): min(len(samples), int(idx[-1]) + p)]
+
+
+def denoise(samples: np.ndarray, sr: int, level: str = "normal") -> np.ndarray:
+    """谱减法降噪（纯 numpy，不装 rnnoise 也能用）。
+
+    用低能量分位估计每个频点的噪声谱，按档位削弱；保留 8% 底噪下限，
+    避免过度衰减产生"音乐噪声"（水声）。level: off/light/normal/strong
+    """
+    strength = {"off": 0.0, "light": 0.55, "normal": 0.85, "strong": 1.0}.get(level, 0.85)
+    if strength <= 0 or samples.size < 2048:
+        return samples
+    n_fft, hop = 1024, 256
+    win = np.hanning(n_fft).astype(np.float32)
+    x = np.concatenate([np.zeros(n_fft, np.float32), samples.astype(np.float32), np.zeros(n_fft, np.float32)])
+    n_frames = 1 + (len(x) - n_fft) // hop
+    if n_frames < 3:
+        return samples
+    idx = np.arange(n_fft)[None, :] + hop * np.arange(n_frames)[:, None]
+    frames = x[idx] * win
+    spec = np.fft.rfft(frames, axis=1)
+    mag = np.abs(spec)
+    noise = np.percentile(mag, 12, axis=0)
+    gain = 1.0 - strength * (noise[None, :] / (mag + 1e-8))
+    gain = np.clip(gain, 0.08, 1.0)
+    rec = np.fft.irfft(mag * gain * np.exp(1j * np.angle(spec)), n=n_fft, axis=1).astype(np.float32) * win
+    out = np.zeros(len(x), np.float32)
+    wsum = np.zeros(len(x), np.float32)
+    for i in range(n_frames):
+        s = i * hop
+        out[s:s + n_fft] += rec[i]
+        wsum[s:s + n_fft] += win * win
+    out /= np.maximum(wsum, 1e-6)
+    return np.ascontiguousarray(out[n_fft:n_fft + len(samples)])
+
+
+def normalize_peak(samples: np.ndarray, target: float = 0.9) -> np.ndarray:
+    """音量过小时抬到 target；已经够响就不动，避免削波。"""
+    peak = float(np.abs(samples).max()) if samples.size else 0.0
+    if peak <= 1e-5:
+        return samples
+    if peak < 0.25:
+        return np.ascontiguousarray(samples * (target / peak), dtype=np.float32)
+    if peak > 0.999:
+        return np.ascontiguousarray(samples * (0.99 / peak), dtype=np.float32)
+    return samples
+
+
+def analyze_ref(samples: np.ndarray, sr: int) -> dict:
+    """给前端显示的参考音频体检结果。"""
+    dur = len(samples) / sr if sr else 0.0
+    peak = float(np.abs(samples).max()) if samples.size else 0.0
+    rms = float(np.sqrt(np.mean(samples ** 2))) if samples.size else 0.0
+    clip_ratio = float(np.mean(np.abs(samples) > 0.995)) if samples.size else 0.0
+    warn = []
+    if dur < 1.0:
+        warn.append("时长不足 1 秒，克隆出来会很不稳")
+    elif dur > 12:
+        warn.append("超过 12 秒，每段合成都会变慢，建议截到 3~10 秒")
+    if peak < 0.05:
+        warn.append("音量太小，建议重录或提高增益")
+    if clip_ratio > 0.002:
+        warn.append("有削波（爆音），建议降低录音音量重录")
+    return {
+        "duration": round(dur, 2),
+        "sample_rate": int(sr),
+        "peak": round(peak, 4),
+        "rms_db": round(20 * np.log10(max(rms, 1e-8)), 1),
+        "warnings": warn,
+    }
+
+
+def write_ref_wav(samples: np.ndarray, sr: int, dst: Path) -> None:
+    """参考音频统一存成 16bit PCM 单声道 wav。"""
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    sf.write(str(dst), np.clip(samples, -1.0, 1.0), int(sr), subtype="PCM_16")
+
+
+_CODE_RE = re.compile(r"^[A-Za-z0-9_]{1,32}$")
+
+
+def make_code(existing: set) -> str:
+    """自动分配 6 位代号，保证不与现有音色冲突。"""
+    for _ in range(200):
+        c = secrets.token_hex(3)
+        if c not in existing:
+            return c
+    raise RuntimeError("自动分配代号失败，请手动指定")
 
 
 # --------------------------------------------------------------------------- 引擎
@@ -388,8 +536,10 @@ class ZipVoiceEngine:
         if not self.cache_dir:
             return None
         v = self.voices.get(voice)
+        # 参考音频 mtime + 转写内容都进 key：改了 .txt 也能自动失效，不用手动清缓存
+        txt_sig = hashlib.md5(v.text.encode("utf-8")).hexdigest()[:8]
         key = hashlib.md5(
-            f"{self._cache_salt}|{voice}|{v.mtime_ns}|{num_steps}|{speed:.2f}|{text}".encode()
+            f"{self._cache_salt}|{voice}|{v.mtime_ns}|{txt_sig}|{num_steps}|{speed:.2f}|{text}".encode()
         ).hexdigest()
         return self.cache_dir / key[:2] / f"{key}.wav"
 
@@ -416,11 +566,13 @@ class ZipVoiceEngine:
             raise ValueError(f"音色库为空，往 {self.voices_dir} 里放 <名字>.wav + <名字>.txt")
         if not voice:
             voice = names[0]
+        vmeta = self.voices.get(voice)
         ref_audio, ref_sr = self.voices.audio(voice)
-        ref_text = self.voices.get(voice).text
+        ref_text = vmeta.text
 
-        speed = float(self.default_speed if speed is None else speed)
-        num_steps = int(self.default_num_steps if num_steps is None else num_steps)
+        # 没显式传参就用这个音色的旁挂默认值（克隆时定下的精度/语速）
+        speed = float(vmeta.speed or self.default_speed) if speed is None else float(speed)
+        num_steps = int(vmeta.num_steps or self.default_num_steps) if num_steps is None else int(num_steps)
         num_steps = max(1, min(num_steps, 32))
         speed = max(0.2, min(speed, 3.0))
 
@@ -504,8 +656,8 @@ def _pick_param(q, *keys: str) -> Optional[str]:
     return None
 
 
-def _as_float(raw: Optional[str], default: float) -> float:
-    if not raw:
+def _as_float(raw: Optional[str], default: Optional[float] = None) -> Optional[float]:
+    if raw is None or raw == "":
         return default
     try:
         return float(raw)
@@ -517,9 +669,14 @@ def _as_float(raw: Optional[str], default: float) -> float:
 def index():
     return {
         "service": "zipvoice-tts",
+        "ui": "/ui",
         "endpoints": {
+            "GET /ui": "音色管理与试听界面",
             "GET /tts": "?text=...&voice=...&speed=1.0&num_steps=4&nocache=0  -> audio/wav（Legado 用这个）",
             "GET /voices": "音色列表",
+            "POST /voices": "克隆新音色（JSON + base64 wav）",
+            "PATCH /voices/{code}": "改展示名/精度/语速/参考文本",
+            "DELETE /voices/{code}": "删除音色",
             "GET /health": "状态",
         },
     }
@@ -560,13 +717,21 @@ def voices():
             continue
         out.append(
             {
-                "name": name,
+                "name": name,                                  # 内部标识 = API 里的 voice
+                "code": name,
+                "display": v.display or name,
                 "duration": round(dur, 2),
                 "sample_rate": sr,
                 "ref_text": v.text,
                 "chars": len(v.text),
+                "num_steps": v.num_steps or ENGINE.default_num_steps,
+                "speed": round(v.speed or ENGINE.default_speed, 2),
+                "created": v.created,
+                "has_meta": v.has_meta,
             }
         )
+    # 新建的排前面，老音色（没有 created）按名字排后面
+    out.sort(key=lambda x: (-x["created"], x["name"]))
     return {"voices": out, "default": out[0]["name"] if out else None}
 
 
@@ -578,8 +743,10 @@ def tts(request: Request):
     text = _pick_param(q, "text", "speakText", "txt", "t") or ""
     voice = _pick_param(q, "voice", "speaker", "v")
     try:
-        speed = _as_float(q.get("speed"), ENGINE.default_speed)
-        num_steps = int(_as_float(q.get("num_steps"), ENGINE.default_num_steps))
+        # 不传 speed / num_steps 时用该音色旁挂的默认值（克隆时定下的），再回退到服务全局默认
+        speed = _as_float(q.get("speed"))
+        _ns = _as_float(q.get("num_steps"))
+        num_steps = int(_ns) if _ns is not None else None
         use_cache = str(q.get("nocache", "0")).lower() not in ("1", "true", "yes")
         res = ENGINE.synthesize(text, voice=voice, speed=speed, num_steps=num_steps, use_cache=use_cache)
     except KeyError as e:
@@ -606,6 +773,244 @@ def tts(request: Request):
             "Cache-Control": "no-store",
         },
     )
+
+
+# --------------------------------------------------------------------------- 音色管理 UI / API
+WEBUI = Path(__file__).resolve().parent / "webui" / "index.html"
+PREVIEW_TEXT = "这是语音预览，听一下这个音色合不合你的口味。"
+
+
+@app.get("/ui")
+def ui():
+    if not WEBUI.is_file():
+        return JSONResponse(
+            {"ok": False, "error": f"找不到界面文件 {WEBUI}（部署时要把 webui/ 一起带上）"},
+            status_code=404,
+        )
+    return FileResponse(str(WEBUI), media_type="text/html; charset=utf-8")
+
+
+@app.get("/preview")
+def preview(request: Request):
+    """试听：默认念一句固定短句，2 秒左右，比念整段快得多。"""
+    if ENGINE is None:
+        return JSONResponse({"ok": False, "error": "engine not initialized"}, status_code=503)
+    q = request.query_params
+    voice = _pick_param(q, "voice", "v")
+    text = _pick_param(q, "text", "t") or PREVIEW_TEXT
+    try:
+        _sp = _as_float(q.get("speed"))
+        _ns = _as_float(q.get("num_steps"))
+        use_cache = str(q.get("nocache", "0")).lower() not in ("1", "true", "yes")
+        res = ENGINE.synthesize(
+            text,
+            voice=voice,
+            speed=_sp,
+            num_steps=int(_ns) if _ns is not None else None,
+            use_cache=use_cache,
+        )
+    except KeyError as e:
+        return JSONResponse({"ok": False, "error": f"音色不存在: {e.args[0]}"}, status_code=404)
+    except ValueError as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+    except Exception as e:  # noqa: BLE001
+        LOG.exception("试听合成失败")
+        return JSONResponse({"ok": False, "error": f"{type(e).__name__}: {e}"}, status_code=500)
+    return Response(
+        content=res.wav,
+        media_type="audio/wav",
+        headers={"X-Elapsed": f"{res.elapsed:.3f}", "X-Audio-Seconds": f"{res.audio_seconds:.3f}", "Cache-Control": "no-store"},
+    )
+
+
+def _voice_paths(code: str) -> Tuple[Path, Path, Path]:
+    """校验代号并返回 (wav, txt, json) 三个路径，顺带挡住目录穿越。"""
+    if not _CODE_RE.match(code or ""):
+        raise ValueError("代号只能用英文、数字、下划线，长度 1~32")
+    if not ENGINE:
+        raise RuntimeError("engine not initialized")
+    base = ENGINE.voices.dir.resolve()
+    wav = (base / f"{code}.wav").resolve()
+    if wav.parent != base:
+        raise ValueError("非法代号")
+    return wav, wav.with_suffix(".txt"), wav.with_suffix(".json")
+
+
+@app.post("/voices")
+async def create_voice(request: Request):
+    """克隆音色：JSON + base64 wav，省掉 python-multipart 依赖。"""
+    if ENGINE is None:
+        return JSONResponse({"ok": False, "error": "engine not initialized"}, status_code=503)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"ok": False, "error": "请求体不是合法 JSON"}, status_code=400)
+
+    name = str(body.get("name") or "").strip()
+    ref_text = str(body.get("ref_text") or "").strip()
+    denoise_level = str(body.get("denoise") or "off").lower()
+    do_trim = bool(body.get("trim", True))
+    b64 = str(body.get("audio_b64") or "")
+
+    if not name:
+        return JSONResponse({"ok": False, "error": "音色名称必填"}, status_code=400)
+    if not ref_text:
+        return JSONResponse({"ok": False, "error": "发音参考文本必填（必须和录音一字不差）"}, status_code=400)
+    if not b64:
+        return JSONResponse({"ok": False, "error": "没有收到参考音频"}, status_code=400)
+
+    # ---- 解码音频（前端已统一转成 16bit PCM wav）
+    try:
+        raw = base64.b64decode(b64, validate=False)
+        samples, sr = sf.read(io.BytesIO(raw), dtype="float32", always_2d=True)
+        samples = to_mono(samples)
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": f"参考音频无法解析（需 wav/pcm）: {e}"}, status_code=400)
+
+    if sr < 8000 or sr > 192000:
+        return JSONResponse({"ok": False, "error": f"采样率异常: {sr}"}, status_code=400)
+    dur = len(samples) / sr
+    if dur < 0.5:
+        return JSONResponse({"ok": False, "error": f"参考音频只有 {dur:.2f} 秒，太短"}, status_code=400)
+    if dur > 60:
+        return JSONResponse({"ok": False, "error": f"参考音频 {dur:.1f} 秒，超过 60 秒上限"}, status_code=400)
+
+    before = analyze_ref(samples, sr)
+    try:
+        if do_trim:
+            samples = trim_silence(samples, sr)
+        if denoise_level not in ("off", "", "none"):
+            samples = denoise(samples, sr, denoise_level)
+        samples = normalize_peak(samples)
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": f"音频预处理失败: {e}"}, status_code=500)
+    after = analyze_ref(samples, sr)
+    if after["duration"] < 0.5:
+        return JSONResponse(
+            {"ok": False, "error": "裁剪后不足 0.5 秒，请换一段带完整句子的录音"},
+            status_code=400,
+        )
+
+    # ---- 代号：不填则自动分配
+    existing = set(ENGINE.voices.names())
+    code = str(body.get("code") or "").strip() or make_code(existing)
+    try:
+        wav_p, txt_p, json_p = _voice_paths(code)
+    except ValueError as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+    if code in existing:
+        return JSONResponse({"ok": False, "error": f"代号 {code} 已被占用"}, status_code=409)
+
+    try:
+        num_steps = int(body.get("num_steps") or ENGINE.default_num_steps)
+        speed = float(body.get("speed") or ENGINE.default_speed)
+    except (TypeError, ValueError):
+        return JSONResponse({"ok": False, "error": "num_steps / speed 必须是数字"}, status_code=400)
+    num_steps = max(1, min(num_steps, 16))
+    speed = max(0.2, min(speed, 3.0))
+
+    try:
+        write_ref_wav(samples, sr, wav_p)
+        txt_p.write_text(ref_text, encoding="utf-8")
+        json_p.write_text(
+            json.dumps(
+                {"name": name, "num_steps": num_steps, "speed": speed, "created": time.time()},
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+    except Exception as e:  # noqa: BLE001
+        LOG.exception("写音色文件失败")
+        return JSONResponse({"ok": False, "error": f"写文件失败: {e}"}, status_code=500)
+
+    ENGINE.voices.rescan(force=True)
+    LOG.info("新音色已加入 code=%s name=%s %.2fs steps=%d speed=%.2f", code, name, after["duration"], num_steps, speed)
+    return {
+        "ok": True,
+        "voice": {
+            "code": code,
+            "display": name,
+            "duration": after["duration"],
+            "sample_rate": sr,
+            "num_steps": num_steps,
+            "speed": speed,
+        },
+        "analysis": {"before": before, "after": after},
+    }
+
+
+@app.patch("/voices/{code}")
+async def update_voice(code: str, request: Request):
+    if ENGINE is None:
+        return JSONResponse({"ok": False, "error": "engine not initialized"}, status_code=503)
+    if code not in set(ENGINE.voices.names()):
+        return JSONResponse({"ok": False, "error": f"音色不存在: {code}"}, status_code=404)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"ok": False, "error": "请求体不是合法 JSON"}, status_code=400)
+
+    try:
+        _wav_p, txt_p, json_p = _voice_paths(code)
+    except ValueError as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+
+    meta: dict = {}
+    if json_p.is_file():
+        try:
+            meta = json.loads(json_p.read_text(encoding="utf-8")) or {}
+        except Exception:
+            meta = {}
+    if not meta.get("created"):
+        meta["created"] = time.time()
+    meta.setdefault("name", code)
+
+    if "name" in body:
+        v = str(body.get("name") or "").strip()
+        if not v:
+            return JSONResponse({"ok": False, "error": "名称不能为空"}, status_code=400)
+        meta["name"] = v
+    if "num_steps" in body:
+        try:
+            meta["num_steps"] = max(1, min(int(body["num_steps"]), 16))
+        except (TypeError, ValueError):
+            return JSONResponse({"ok": False, "error": "num_steps 必须是整数"}, status_code=400)
+    if "speed" in body:
+        try:
+            meta["speed"] = max(0.2, min(float(body["speed"]), 3.0))
+        except (TypeError, ValueError):
+            return JSONResponse({"ok": False, "error": "speed 必须是数字"}, status_code=400)
+    if "ref_text" in body:
+        t = str(body.get("ref_text") or "").strip()
+        if not t:
+            return JSONResponse({"ok": False, "error": "参考文本不能为空"}, status_code=400)
+        txt_p.write_text(t, encoding="utf-8")
+        # 转写进了缓存 key（见 _cache_path），改完自动失效，不必手动清缓存
+
+    json_p.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+    ENGINE.voices.rescan(force=True)
+    return {"ok": True, "voice": {"code": code, **meta}}
+
+
+@app.delete("/voices/{code}")
+def delete_voice(code: str):
+    if ENGINE is None:
+        return JSONResponse({"ok": False, "error": "engine not initialized"}, status_code=503)
+    if code not in set(ENGINE.voices.names()):
+        return JSONResponse({"ok": False, "error": f"音色不存在: {code}"}, status_code=404)
+    try:
+        wav_p, txt_p, json_p = _voice_paths(code)
+    except ValueError as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+    removed = []
+    for p in (wav_p, txt_p, json_p):
+        if p.is_file():
+            p.unlink()
+            removed.append(p.name)
+    ENGINE.voices.rescan(force=True)
+    LOG.info("音色已删除 code=%s，移除文件 %s", code, removed)
+    return {"ok": True, "removed": removed, "voices": ENGINE.voices.names()}
 
 
 # --------------------------------------------------------------------------- CLI
