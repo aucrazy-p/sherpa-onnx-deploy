@@ -13,3 +13,6 @@ __pycache__/
 
 # 项目记忆
 .workbuddy/
+
+# 测试书
+.fixtures/
