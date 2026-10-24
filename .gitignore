@@ -16,3 +16,7 @@ __pycache__/
 
 # 测试书
 .fixtures/
+
+# 小说原文，不入库（体积大且涉版权）
+*.txt
+!requirements.txt
